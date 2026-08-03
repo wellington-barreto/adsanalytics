@@ -183,6 +183,7 @@ async function ingestGoogleAdsScript(payload) {
       search_impression_share: number(row.search_impression_share),
       search_top_impression_share: number(row.search_top_impression_share),
       search_absolute_top_impression_share: number(row.search_absolute_top_impression_share),
+      final_url: text(row.final_url, 2000),
       source: "google_ads_script",
       synced_at: now
     })).filter(row => row.campaign_id && row.report_date);
@@ -460,6 +461,35 @@ const sumRows = rows => rows.reduce((total, row) => ({
   revenue: total.revenue + number(row.conversion_value)
 }), { impressions: 0, clicks: 0, cost: 0, conversions: 0, revenue: 0 });
 
+const manualMetrics = rows => rows.reduce((total, row) => ({
+  page_visits: total.page_visits + number(row.page_visits),
+  vsl_clicks: total.vsl_clicks + number(row.vsl_clicks),
+  vsl_checkouts: total.vsl_checkouts + number(row.vsl_checkouts),
+  general_checkouts: total.general_checkouts + number(row.general_checkouts),
+  sales: total.sales + number(row.sales),
+  revenue: total.revenue + number(row.revenue),
+  refunds: total.refunds + number(row.refunds)
+}), { page_visits: 0, vsl_clicks: 0, vsl_checkouts: 0, general_checkouts: 0, sales: 0, revenue: 0, refunds: 0 });
+
+const mergeDaily = (googleRows, manualRows) => {
+  const manual = new Map(manualRows.map(row => [row.report_date, row]));
+  const dates = [...new Set([...googleRows.map(row => row.report_date), ...manualRows.map(row => row.report_date)])].sort().reverse();
+  return dates.map(reportDate => {
+    const google = googleRows.find(row => row.report_date === reportDate) || { report_date: reportDate };
+    const extra = manual.get(reportDate);
+    return {
+      ...google,
+      manual: extra || null,
+      page_visits: number(extra?.page_visits), vsl_clicks: number(extra?.vsl_clicks),
+      vsl_checkouts: number(extra?.vsl_checkouts), general_checkouts: number(extra?.general_checkouts),
+      refunds: number(extra?.refunds),
+      conversions: extra ? number(extra.sales) : number(google.conversions),
+      conversion_value: extra ? number(extra.revenue) - number(extra.refunds) : number(google.conversion_value),
+      data_origin: extra ? (google.campaign_id ? "manual+script" : "manual") : "script"
+    };
+  });
+};
+
 async function getDashboard(url) {
   const userId = process.env.APP_USER_ID;
   const to = validDateOr(url.searchParams.get("to"), day(0));
@@ -467,7 +497,10 @@ async function getDashboard(url) {
   const settings = await sbAll(`campaign_settings?user_id=eq.${enc(userId)}&select=*`);
   const starts = settings.map(item => item.test_start_date).filter(Boolean).sort();
   const fetchFrom = starts.length && starts[0] < from ? starts[0] : from;
-  const rows = await sbAll(`google_ads_campaign_daily?user_id=eq.${enc(userId)}&report_date=gte.${fetchFrom}&report_date=lte.${to}&order=report_date.asc&select=*`);
+  const [rows, manualRows] = await Promise.all([
+    sbAll(`google_ads_campaign_daily?user_id=eq.${enc(userId)}&report_date=gte.${fetchFrom}&report_date=lte.${to}&order=report_date.asc&select=*`),
+    sbAll(`campaign_manual_daily?user_id=eq.${enc(userId)}&report_date=gte.${fetchFrom}&report_date=lte.${to}&select=*`)
+  ]);
   const periodRows = rows.filter(row => row.report_date >= from && row.report_date <= to);
   const currencies = [...new Set(periodRows.map(row => row.currency_code).filter(Boolean))].sort();
   const requestedCurrency = url.searchParams.get("currency");
@@ -483,6 +516,8 @@ async function getDashboard(url) {
   const campaigns = [...groups.entries()].map(([key, campaignRows]) => {
     const latest = [...campaignRows].sort((a, b) => b.report_date.localeCompare(a.report_date))[0];
     const metrics = sumRows(campaignRows);
+    const manual = manualMetrics(manualRows.filter(row => campaignKey(row) === key && row.report_date >= from));
+    if (manual.sales || manual.revenue || manual.refunds) { metrics.conversions = manual.sales; metrics.revenue = manual.revenue - manual.refunds; }
     const setting = settingsMap.get(key) || null;
     const testRows = setting?.test_start_date
       ? rows.filter(row => campaignKey(row) === key && row.report_date >= setting.test_start_date && row.report_date <= to)
@@ -516,12 +551,14 @@ async function getDashboard(url) {
     };
   }).sort((a, b) => b.cost - a.cost);
   const syncRuns = await sbAll(`google_ads_sync_runs?user_id=eq.${enc(userId)}&status=in.(success,partial)&order=finished_at.desc&limit=1&select=finished_at,status,source,metadata`);
+  const daily = [...new Set(currencyRows.map(row => row.report_date))].sort().map(report_date => ({ report_date, ...sumRows(currencyRows.filter(row => row.report_date === report_date)) }));
   return {
     period: { from, to },
     currency,
     currencies,
     accounts: [...new Set(campaigns.map(item => item.account_name).filter(Boolean))].sort(),
     campaigns,
+    daily,
     summary: sumRows(currencyRows),
     last_sync: syncRuns[0] || null
   };
@@ -537,17 +574,20 @@ async function getCampaignDetail(url) {
   const base = `user_id=eq.${enc(userId)}&customer_id=eq.${enc(customerId)}&campaign_id=eq.${enc(campaignId)}`;
   const settings = await sbAll(`campaign_settings?${base}&select=*`);
   const setting = settings[0] || null;
-  const [daily, searchTerms, segments, changes, notes] = await Promise.all([
+  const [googleDaily, manualDaily, searchTerms, segments, changes, notes, strategies] = await Promise.all([
     sbAll(`google_ads_campaign_daily?${base}&report_date=gte.${from}&report_date=lte.${to}&order=report_date.asc&select=*`),
+    sbAll(`campaign_manual_daily?${base}&report_date=gte.${from}&report_date=lte.${to}&order=report_date.desc&select=*`),
     sbAll(`google_ads_search_terms_daily?${base}&report_date=gte.${from}&report_date=lte.${to}&order=cost_micros.desc&select=*`),
     sbAll(`google_ads_segments_daily?${base}&report_date=gte.${from}&report_date=lte.${to}&order=cost_micros.desc&select=*`),
     sbAll(`google_ads_change_events?${base}&change_date_time=gte.${from}T00%3A00%3A00Z&change_date_time=lte.${to}T23%3A59%3A59Z&order=change_date_time.desc&select=*`),
-    sbAll(`campaign_notes?${base}&order=note_date.desc,created_at.desc&select=*`)
+    sbAll(`campaign_notes?${base}&order=note_date.desc,created_at.desc&select=*`),
+    sbAll(`campaign_strategies?${base}&select=*`)
   ]);
+  const daily = mergeDaily(googleDaily, manualDaily);
   const testDaily = setting?.test_start_date && setting.test_start_date < from
     ? await sbAll(`google_ads_campaign_daily?${base}&report_date=gte.${setting.test_start_date}&report_date=lte.${to}&select=cost_micros,conversions,conversion_value`)
     : daily.filter(row => !setting?.test_start_date || row.report_date >= setting.test_start_date);
-  return { customer_id: customerId, campaign_id: campaignId, period: { from, to }, daily, search_terms: searchTerms, segments, changes, notes, setting, test_metrics: sumRows(testDaily) };
+  return { customer_id: customerId, campaign_id: campaignId, period: { from, to }, daily, search_terms: searchTerms, segments, changes, notes, setting, strategy: strategies[0] || null, test_metrics: sumRows(testDaily) };
 }
 
 async function saveCampaignSetting(data) {
@@ -578,6 +618,31 @@ async function saveCampaignSetting(data) {
   return result?.[0] || row;
 }
 
+async function savePreference(data) {
+  const row = { user_id: process.env.APP_USER_ID, theme: data.theme === "light" ? "light" : "dark", display_currency: ["USD","BRL","EUR"].includes(data.display_currency) ? data.display_currency : "USD", visible_columns: data.visible_columns && typeof data.visible_columns === "object" ? data.visible_columns : {}, updated_at: new Date().toISOString() };
+  const result = await sb("user_dashboard_preferences?on_conflict=user_id", { method: "POST", headers: { Prefer: "resolution=merge-duplicates,return=representation" }, body: JSON.stringify(row) });
+  return result?.[0] || row;
+}
+
+async function saveStrategy(data) {
+  const customerId = cleanId(data.customer_id), campaignId = cleanId(data.campaign_id);
+  if (!customerId || !campaignId) throw apiError("Conta e campanha são obrigatórias", 400);
+  const row = { user_id: process.env.APP_USER_ID, customer_id: customerId, campaign_id: campaignId, content: text(data.content || "", 20000), updated_at: new Date().toISOString() };
+  const result = await sb("campaign_strategies?on_conflict=user_id,customer_id,campaign_id", { method: "POST", headers: { Prefer: "resolution=merge-duplicates,return=representation" }, body: JSON.stringify(row) });
+  return result?.[0] || row;
+}
+
+async function saveManualDaily(data) {
+  const customerId = cleanId(data.customer_id), campaignId = cleanId(data.campaign_id), reportDate = isoDate(data.report_date);
+  if (!customerId || !campaignId || !reportDate) throw apiError("Conta, campanha e data são obrigatórias", 400);
+  const fields = ["page_visits","vsl_clicks","vsl_checkouts","general_checkouts","sales","revenue","refunds"];
+  for (const field of fields) if (number(data[field]) < 0) throw apiError("Os valores não podem ser negativos", 400);
+  const row = { user_id: process.env.APP_USER_ID, customer_id: customerId, campaign_id: campaignId, report_date: reportDate, currency_code: ["USD","BRL","EUR"].includes(data.currency_code) ? data.currency_code : "USD", ...Object.fromEntries(fields.map(field => [field, number(data[field])])), observation: text(data.observation, 3000), source: "manual", updated_at: new Date().toISOString() };
+  const result = await sb("campaign_manual_daily?on_conflict=user_id,customer_id,campaign_id,report_date", { method: "POST", headers: { Prefer: "resolution=merge-duplicates,return=representation" }, body: JSON.stringify(row) });
+  await sb("campaign_notes", { method: "POST", body: JSON.stringify({ user_id: process.env.APP_USER_ID, customer_id: customerId, campaign_id: campaignId, note_date: reportDate, category: "quick_entry", title: "Lançamento rápido", content: `Dados manuais atualizados: ${number(data.sales)} venda(s), receita ${number(data.revenue)} ${row.currency_code}.` }) });
+  return result?.[0] || row;
+}
+
 const mime = {
   ".html": "text/html",
   ".js": "text/javascript",
@@ -590,7 +655,7 @@ http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, "http://localhost");
     if (url.pathname === "/api/health" && req.method === "GET") {
-      return json(res, 200, { status: "ok", app: "AdsPilot Analytics", version: "2.0.0", mode: process.env.SUPABASE_URL ? "configured" : "demo" });
+      return json(res, 200, { status: "ok", app: "AdsPilot Analytics", version: "2.1.0", mode: process.env.SUPABASE_URL ? "configured" : "demo" });
     }
     if (url.pathname === "/api/config/status" && req.method === "GET") {
       return json(res, 200, configStatus());
@@ -615,6 +680,14 @@ http.createServer(async (req, res) => {
       await authenticate(req);
       return json(res, 200, await getDashboard(url));
     }
+    if (url.pathname === "/api/v2/preferences" && req.method === "GET") {
+      await authenticate(req);
+      const rows = await sbAll(`user_dashboard_preferences?user_id=eq.${enc(process.env.APP_USER_ID)}&select=*`);
+      return json(res, 200, rows[0] || { theme: "dark", display_currency: "USD", visible_columns: {} });
+    }
+    if (url.pathname === "/api/v2/preferences" && (req.method === "PUT" || req.method === "POST")) {
+      await authenticate(req); return json(res, 200, await savePreference(await readJsonBody(req)));
+    }
     if (url.pathname === "/api/v2/campaign" && req.method === "GET") {
       await authenticate(req);
       return json(res, 200, await getCampaignDetail(url));
@@ -622,6 +695,12 @@ http.createServer(async (req, res) => {
     if (url.pathname === "/api/v2/campaign-settings" && (req.method === "PUT" || req.method === "POST")) {
       await authenticate(req);
       return json(res, 200, await saveCampaignSetting(await readJsonBody(req)));
+    }
+    if (url.pathname === "/api/v2/strategy" && (req.method === "PUT" || req.method === "POST")) {
+      await authenticate(req); return json(res, 200, await saveStrategy(await readJsonBody(req)));
+    }
+    if (url.pathname === "/api/v2/manual-daily" && (req.method === "PUT" || req.method === "POST")) {
+      await authenticate(req); return json(res, 200, await saveManualDaily(await readJsonBody(req)));
     }
     if (url.pathname === "/api/v2/notes" && req.method === "POST") {
       await authenticate(req);
@@ -668,4 +747,4 @@ http.createServer(async (req, res) => {
     console.error(error);
     json(res, error.statusCode || 500, { error: error.statusCode ? error.message : "Erro interno" });
   }
-}).listen(port, "0.0.0.0", () => console.log(`AdsPilot v2.0.0 on ${port}`));
+}).listen(port, "0.0.0.0", () => console.log(`AdsPilot v2.1.0 on ${port}`));

@@ -1,5 +1,5 @@
 /**
- * AdsPilot Analytics V1.2.1
+ * AdsPilot Analytics V2.1
  * Funciona em conta individual ou MCC.
  * Somente leitura: nao cria nem altera campanhas, anuncios, palavras ou lances.
  */
@@ -67,11 +67,14 @@ function collectAndSend_(config) {
   var genders = safeQuery_(genderQuery_(dates.start, dates.end), config, "generos", errors);
   var incomes = safeQuery_(incomeQuery_(dates.start, dates.end), config, "rendas", errors);
   var locations = safeQuery_(locationQuery_(dates.start, dates.end), config, "locais", errors);
+  var targetedLocations = safeQuery_(targetedLocationQuery_(dates.start, dates.end), config, "locais segmentados", errors);
+  var geoConstants = safeQuery_(geoConstantsQuery_(criterionIds_(targetedLocations)), config, "nomes dos locais", errors);
+  var landingPages = safeQuery_(landingPageQuery_(dates.start, dates.end), config, "paginas finais", errors);
   var changes = safeQuery_(changeQuery_(dates.start, dates.end, config.MAX_CHANGE_EVENTS), config, "alteracoes", errors);
 
   var payload = {
     schema_version: "1.2",
-    script_name: "AdsPilot Google Ads Script V1.2.1",
+    script_name: "AdsPilot Google Ads Script V2.1",
     started_at: startedAt,
     account: {
       customer_id: account.getCustomerId(),
@@ -79,9 +82,9 @@ function collectAndSend_(config) {
       currency_code: account.getCurrencyCode(),
       timezone: account.getTimeZone()
     },
-    campaign_daily: mapCampaigns_(campaigns),
+    campaign_daily: mapCampaigns_(campaigns, landingPages),
     search_terms: aggregateSearchTerms_(mapSearchTerms_(searchTerms)),
-    segments: mapSegments_(devices, ages, genders, incomes, locations),
+    segments: mapSegments_(devices, ages, genders, incomes, locations, targetedLocations, geoConstants),
     change_events: mapChanges_(changes),
     query_errors: errors
   };
@@ -183,6 +186,22 @@ function locationQuery_(start, end) {
     "FROM geographic_view WHERE segments.date BETWEEN '" + start + "' AND '" + end + "' AND metrics.impressions > 0";
 }
 
+function targetedLocationQuery_(start, end) {
+  return "SELECT segments.date, campaign.id, ad_group_criterion.criterion_id, metrics.impressions, metrics.clicks, " +
+    "metrics.cost_micros, metrics.conversions, metrics.conversions_value FROM location_view " +
+    "WHERE segments.date BETWEEN '" + start + "' AND '" + end + "' AND metrics.impressions > 0";
+}
+
+function geoConstantsQuery_(ids) {
+  if (!ids.length) return "SELECT geo_target_constant.id, geo_target_constant.name, geo_target_constant.canonical_name, geo_target_constant.target_type FROM geo_target_constant WHERE geo_target_constant.id = 0";
+  return "SELECT geo_target_constant.id, geo_target_constant.name, geo_target_constant.canonical_name, geo_target_constant.target_type FROM geo_target_constant WHERE geo_target_constant.id IN (" + ids.join(",") + ")";
+}
+
+function landingPageQuery_(start, end) {
+  return "SELECT campaign.id, landing_page_view.unexpanded_final_url, metrics.clicks FROM landing_page_view " +
+    "WHERE segments.date BETWEEN '" + start + "' AND '" + end + "' AND metrics.clicks > 0 ORDER BY metrics.clicks DESC";
+}
+
 function changeQuery_(start, end, limit) {
   var endExclusive = addDays_(end, 1);
   return "SELECT change_event.resource_name, change_event.change_date_time, change_event.change_resource_name, " +
@@ -193,8 +212,10 @@ function changeQuery_(start, end, limit) {
     "ORDER BY change_event.change_date_time DESC LIMIT " + limit;
 }
 
-function mapCampaigns_(rows) {
+function mapCampaigns_(rows, landingPages) {
   var output = [];
+  var urls = {};
+  for (var u = 0; u < landingPages.length; u++) if (!urls[String(landingPages[u].campaign.id)]) urls[String(landingPages[u].campaign.id)] = landingPages[u].landingPageView.unexpandedFinalUrl;
   for (var i = 0; i < rows.length; i++) {
     var row = rows[i];
     var targetCpa = value_(row.campaign.maximizeConversions && row.campaign.maximizeConversions.targetCpaMicros);
@@ -219,6 +240,7 @@ function mapCampaigns_(rows) {
       search_impression_share: value_(row.metrics.searchImpressionShare),
       search_top_impression_share: value_(row.metrics.searchTopImpressionShare),
       search_absolute_top_impression_share: value_(row.metrics.searchAbsoluteTopImpressionShare)
+      ,final_url: urls[String(row.campaign.id)] || null
     });
   }
   return output;
@@ -261,14 +283,31 @@ function aggregateSearchTerms_(rows) {
   return output;
 }
 
-function mapSegments_(devices, ages, genders, incomes, locations) {
+function mapSegments_(devices, ages, genders, incomes, locations, targetedLocations, geoConstants) {
   var output = [];
   appendSegmentRows_(output, devices, "device", function(row) { return row.segments.device; });
   appendSegmentRows_(output, ages, "age", function(row) { return row.adGroupCriterion.ageRange.type; });
   appendSegmentRows_(output, genders, "gender", function(row) { return row.adGroupCriterion.gender.type; });
   appendSegmentRows_(output, incomes, "income", function(row) { return row.adGroupCriterion.incomeRange.type; });
-  appendSegmentRows_(output, locations, "country", function(row) { return String(row.geographicView.countryCriterionId); });
+  var geo = {};
+  for (var i = 0; i < geoConstants.length; i++) geo[String(geoConstants[i].geoTargetConstant.id)] = geoConstants[i].geoTargetConstant;
+  appendSegmentRows_(output, targetedLocations, "geo", function(row) {
+    var item = geo[String(row.adGroupCriterion.criterionId)] || {};
+    var type = String(item.targetType || "location").toLowerCase();
+    return type + "::" + String(item.canonicalName || item.name || row.adGroupCriterion.criterionId);
+  });
+  for (var j = 0; j < output.length; j++) if (output[j].segment_type === "geo") {
+    var pieces = output[j].segment_value.split("::");
+    output[j].segment_type = pieces[0] === "country" ? "country" : pieces[0] === "state" || pieces[0] === "province" ? "state" : pieces[0] === "city" ? "city" : "location";
+    output[j].segment_value = pieces.slice(1).join("::");
+  }
   return aggregateSegments_(output);
+}
+
+function criterionIds_(rows) {
+  var seen = {}, ids = [];
+  for (var i = 0; i < rows.length; i++) { var id = String(rows[i].adGroupCriterion.criterionId || ""); if (id && !seen[id]) { seen[id] = true; ids.push(id); } }
+  return ids.slice(0, 10000);
 }
 
 function appendSegmentRows_(target, rows, type, getValue) {
