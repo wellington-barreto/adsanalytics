@@ -83,6 +83,30 @@ const chunkedUpsert = async (table, conflict, rows) => {
   return rows.length;
 };
 
+const dedupeLast = (rows, keyFields) => {
+  const map = new Map();
+  for (const row of rows) map.set(keyFields.map(field => row[field]).join("\u001f"), row);
+  return [...map.values()];
+};
+
+const aggregateDuplicates = (rows, keyFields) => {
+  const metrics = ["impressions", "clicks", "cost_micros", "conversions", "conversion_value"];
+  const map = new Map();
+  for (const row of rows) {
+    const key = keyFields.map(field => row[field]).join("\u001f");
+    const current = map.get(key);
+    if (!current) {
+      map.set(key, { ...row });
+      continue;
+    }
+    for (const metric of metrics) current[metric] = number(current[metric]) + number(row[metric]);
+    current.synced_at = row.synced_at;
+  }
+  return [...map.values()];
+};
+
+const errorCode = error => crypto.createHash("sha256").update(String(error?.message || error)).digest("hex").slice(0, 12);
+
 const validateScriptPayload = payload => {
   if (payload?.schema_version !== "1.2") {
     const error = new Error("schema_version deve ser 1.2");
@@ -215,25 +239,74 @@ async function ingestGoogleAdsScript(payload) {
       };
     }).filter(row => row.change_date_time);
 
-    const counts = {
-      campaignRows: await chunkedUpsert("google_ads_campaign_daily", "user_id,customer_id,campaign_id,report_date", campaigns),
-      searchTermRows: await chunkedUpsert("google_ads_search_terms_daily", "user_id,customer_id,campaign_id,report_date,search_term", searchTerms),
-      segmentRows: await chunkedUpsert("google_ads_segments_daily", "user_id,customer_id,campaign_id,report_date,segment_type,segment_value", segments),
-      changeEventRows: await chunkedUpsert("google_ads_change_events", "resource_name", events)
-    };
+    const datasets = [
+      {
+        name: "campaigns",
+        count: "campaignRows",
+        table: "google_ads_campaign_daily",
+        conflict: "user_id,customer_id,campaign_id,report_date",
+        rows: dedupeLast(campaigns, ["user_id", "customer_id", "campaign_id", "report_date"])
+      },
+      {
+        name: "search_terms",
+        count: "searchTermRows",
+        table: "google_ads_search_terms_daily",
+        conflict: "user_id,customer_id,campaign_id,report_date,search_term",
+        rows: aggregateDuplicates(searchTerms, ["user_id", "customer_id", "campaign_id", "report_date", "search_term"])
+      },
+      {
+        name: "segments",
+        count: "segmentRows",
+        table: "google_ads_segments_daily",
+        conflict: "user_id,customer_id,campaign_id,report_date,segment_type,segment_value",
+        rows: aggregateDuplicates(segments, ["user_id", "customer_id", "campaign_id", "report_date", "segment_type", "segment_value"])
+      },
+      {
+        name: "change_events",
+        count: "changeEventRows",
+        table: "google_ads_change_events",
+        conflict: "resource_name",
+        rows: dedupeLast(events, ["resource_name"])
+      }
+    ];
+    const counts = { campaignRows: 0, searchTermRows: 0, segmentRows: 0, changeEventRows: 0 };
+    const datasetErrors = [];
+    for (const dataset of datasets) {
+      try {
+        counts[dataset.count] = await chunkedUpsert(dataset.table, dataset.conflict, dataset.rows);
+      } catch (error) {
+        const code = errorCode(error);
+        console.error(`Ingest ${customerId} ${dataset.name} [${code}]`, error);
+        datasetErrors.push({ dataset: dataset.name, code, message: text(error.message, 2000) });
+      }
+    }
+    const finalStatus = datasetErrors.length === 0 ? "success" : datasetErrors.length === datasets.length ? "error" : "partial";
 
     if (runId) await sb(`google_ads_sync_runs?id=eq.${runId}`, {
       method: "PATCH",
       body: JSON.stringify({
-        status: "success",
+        status: finalStatus,
         finished_at: new Date().toISOString(),
         campaign_rows: counts.campaignRows,
         search_term_rows: counts.searchTermRows,
         segment_rows: counts.segmentRows,
-        change_event_rows: counts.changeEventRows
+        change_event_rows: counts.changeEventRows,
+        error_message: datasetErrors.length ? datasetErrors.map(item => `${item.dataset}[${item.code}]: ${item.message}`).join(" | ").slice(0, 2000) : null,
+        metadata: {
+          schema_version: payload.schema_version,
+          timezone: text(payload.account?.timezone, 100),
+          script_name: text(payload.script_name, 200),
+          query_errors: Array.isArray(payload.query_errors) ? payload.query_errors.slice(0, 20) : [],
+          dataset_errors: datasetErrors.map(({ dataset, code }) => ({ dataset, code }))
+        }
       })
     });
-    return { status: "ok", customer_id: customerId, ...counts };
+    return {
+      status: finalStatus === "success" ? "ok" : finalStatus,
+      customer_id: customerId,
+      ...counts,
+      errors: datasetErrors.map(({ dataset, code }) => ({ dataset, code }))
+    };
   } catch (error) {
     if (runId) {
       try {
@@ -361,7 +434,7 @@ http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, "http://localhost");
     if (url.pathname === "/api/health" && req.method === "GET") {
-      return json(res, 200, { status: "ok", app: "AdsPilot Analytics", version: "1.2", mode: process.env.SUPABASE_URL ? "configured" : "demo" });
+      return json(res, 200, { status: "ok", app: "AdsPilot Analytics", version: "1.2.1", mode: process.env.SUPABASE_URL ? "configured" : "demo" });
     }
     if (url.pathname === "/api/config/status" && req.method === "GET") {
       return json(res, 200, configStatus());
@@ -403,5 +476,4 @@ http.createServer(async (req, res) => {
     console.error(error);
     json(res, error.statusCode || 500, { error: error.statusCode ? error.message : "Erro interno" });
   }
-}).listen(port, "0.0.0.0", () => console.log(`AdsPilot v1.2 on ${port}`));
-
+}).listen(port, "0.0.0.0", () => console.log(`AdsPilot v1.2.1 on ${port}`));

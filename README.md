@@ -1,10 +1,13 @@
-# AdsPilot Analytics V1.2
+# AdsPilot Analytics V1.2.1
 
 Primeira versão do painel Google Ads: dashboard geral, detalhes de campanha, histórico diário, alterações automáticas, notas manuais e sincronizador Google Ads → Supabase.
 
 A V1.2 acrescenta ingestão autenticada via Google Ads Scripts para uso enquanto
 o Acesso Básico da Google Ads API estiver pendente. Consulte
 `INSTALACAO_V1.2.md`.
+
+A V1.2.1 acrescenta deduplicação defensiva, gravação parcial por conjunto,
+retries do webhook e carga histórica por janelas de até sete dias.
 
 ## Testar localmente
 
