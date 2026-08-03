@@ -416,11 +416,167 @@ const configStatus = () => ({
   googleAdsScript: { secret: configured("GOOGLE_ADS_SCRIPT_SECRET") },
   supabase: {
     url: configured("SUPABASE_URL"),
+    anonKey: configured("SUPABASE_ANON_KEY"),
     serviceRoleKey: configured("SUPABASE_SERVICE_ROLE_KEY"),
     appUserId: configured("APP_USER_ID")
   },
   sync: { secret: configured("SYNC_SECRET") }
 });
+
+const apiError = (message, statusCode) => Object.assign(new Error(message), { statusCode });
+const enc = value => encodeURIComponent(String(value));
+
+async function authenticate(req) {
+  const token = String(req.headers.authorization || "").match(/^Bearer\s+(.+)$/i)?.[1];
+  if (!token) throw apiError("Sessão não informada", 401);
+  const anonKey = process.env.SUPABASE_ANON_KEY;
+  if (!anonKey) throw apiError("SUPABASE_ANON_KEY não configurada", 500);
+  const response = await fetch(`${process.env.SUPABASE_URL}/auth/v1/user`, {
+    headers: { apikey: anonKey, authorization: `Bearer ${token}` }
+  });
+  if (!response.ok) throw apiError("Sessão inválida ou expirada", 401);
+  const user = await response.json();
+  if (!user?.id || user.id !== process.env.APP_USER_ID) throw apiError("Usuário sem acesso ao AdsPilot", 403);
+  return user;
+}
+
+async function sbAll(route) {
+  const output = [];
+  for (let offset = 0; ; offset += 1000) {
+    const rows = await sb(route, { headers: { Range: `${offset}-${offset + 999}` } });
+    output.push(...(rows || []));
+    if (!rows || rows.length < 1000) break;
+  }
+  return output;
+}
+
+const validDateOr = (value, fallback) => /^\d{4}-\d{2}-\d{2}$/.test(String(value || "")) ? String(value) : fallback;
+const campaignKey = row => `${row.customer_id}:${row.campaign_id}`;
+const sumRows = rows => rows.reduce((total, row) => ({
+  impressions: total.impressions + number(row.impressions),
+  clicks: total.clicks + number(row.clicks),
+  cost: total.cost + number(row.cost_micros) / 1e6,
+  conversions: total.conversions + number(row.conversions),
+  revenue: total.revenue + number(row.conversion_value)
+}), { impressions: 0, clicks: 0, cost: 0, conversions: 0, revenue: 0 });
+
+async function getDashboard(url) {
+  const userId = process.env.APP_USER_ID;
+  const to = validDateOr(url.searchParams.get("to"), day(0));
+  const from = validDateOr(url.searchParams.get("from"), day(-29));
+  const settings = await sbAll(`campaign_settings?user_id=eq.${enc(userId)}&select=*`);
+  const starts = settings.map(item => item.test_start_date).filter(Boolean).sort();
+  const fetchFrom = starts.length && starts[0] < from ? starts[0] : from;
+  const rows = await sbAll(`google_ads_campaign_daily?user_id=eq.${enc(userId)}&report_date=gte.${fetchFrom}&report_date=lte.${to}&order=report_date.asc&select=*`);
+  const periodRows = rows.filter(row => row.report_date >= from && row.report_date <= to);
+  const currencies = [...new Set(periodRows.map(row => row.currency_code).filter(Boolean))].sort();
+  const requestedCurrency = url.searchParams.get("currency");
+  const currency = currencies.includes(requestedCurrency) ? requestedCurrency : currencies[0] || "USD";
+  const currencyRows = periodRows.filter(row => (row.currency_code || "USD") === currency);
+  const settingsMap = new Map(settings.map(item => [`${item.customer_id}:${item.campaign_id}`, item]));
+  const groups = new Map();
+  for (const row of currencyRows) {
+    const key = campaignKey(row);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(row);
+  }
+  const campaigns = [...groups.entries()].map(([key, campaignRows]) => {
+    const latest = [...campaignRows].sort((a, b) => b.report_date.localeCompare(a.report_date))[0];
+    const metrics = sumRows(campaignRows);
+    const setting = settingsMap.get(key) || null;
+    const testRows = setting?.test_start_date
+      ? rows.filter(row => campaignKey(row) === key && row.report_date >= setting.test_start_date && row.report_date <= to)
+      : campaignRows;
+    const testCost = sumRows(testRows).cost;
+    const commission = number(setting?.commission_value);
+    const consumedPercent = commission > 0 ? testCost / commission * 100 : null;
+    const limitAmount = commission > 0 ? commission * number(setting?.test_limit_percent || 75) / 100 : null;
+    return {
+      customer_id: latest.customer_id,
+      campaign_id: latest.campaign_id,
+      account_name: latest.account_name,
+      campaign_name: latest.campaign_name,
+      status: latest.campaign_status,
+      channel_type: latest.channel_type,
+      currency_code: latest.currency_code,
+      ...metrics,
+      ctr: metrics.impressions ? metrics.clicks / metrics.impressions : 0,
+      cpc: metrics.clicks ? metrics.cost / metrics.clicks : 0,
+      cpa: metrics.conversions ? metrics.cost / metrics.conversions : null,
+      profit: metrics.revenue - metrics.cost,
+      roi: metrics.cost ? (metrics.revenue - metrics.cost) / metrics.cost * 100 : 0,
+      setting,
+      test: setting ? {
+        cost: testCost,
+        commission,
+        consumed_percent: consumedPercent,
+        limit_amount: limitAmount,
+        remaining_to_limit: limitAmount == null ? null : limitAmount - testCost
+      } : null
+    };
+  }).sort((a, b) => b.cost - a.cost);
+  const syncRuns = await sbAll(`google_ads_sync_runs?user_id=eq.${enc(userId)}&status=in.(success,partial)&order=finished_at.desc&limit=1&select=finished_at,status,source,metadata`);
+  return {
+    period: { from, to },
+    currency,
+    currencies,
+    accounts: [...new Set(campaigns.map(item => item.account_name).filter(Boolean))].sort(),
+    campaigns,
+    summary: sumRows(currencyRows),
+    last_sync: syncRuns[0] || null
+  };
+}
+
+async function getCampaignDetail(url) {
+  const userId = process.env.APP_USER_ID;
+  const customerId = cleanId(url.searchParams.get("customer_id"));
+  const campaignId = cleanId(url.searchParams.get("campaign_id"));
+  if (!customerId || !campaignId) throw apiError("Conta e campanha são obrigatórias", 400);
+  const to = validDateOr(url.searchParams.get("to"), day(0));
+  const from = validDateOr(url.searchParams.get("from"), day(-29));
+  const base = `user_id=eq.${enc(userId)}&customer_id=eq.${enc(customerId)}&campaign_id=eq.${enc(campaignId)}`;
+  const settings = await sbAll(`campaign_settings?${base}&select=*`);
+  const setting = settings[0] || null;
+  const [daily, searchTerms, segments, changes, notes] = await Promise.all([
+    sbAll(`google_ads_campaign_daily?${base}&report_date=gte.${from}&report_date=lte.${to}&order=report_date.asc&select=*`),
+    sbAll(`google_ads_search_terms_daily?${base}&report_date=gte.${from}&report_date=lte.${to}&order=cost_micros.desc&select=*`),
+    sbAll(`google_ads_segments_daily?${base}&report_date=gte.${from}&report_date=lte.${to}&order=cost_micros.desc&select=*`),
+    sbAll(`google_ads_change_events?${base}&change_date_time=gte.${from}T00%3A00%3A00Z&change_date_time=lte.${to}T23%3A59%3A59Z&order=change_date_time.desc&select=*`),
+    sbAll(`campaign_notes?${base}&order=note_date.desc,created_at.desc&select=*`)
+  ]);
+  const testDaily = setting?.test_start_date && setting.test_start_date < from
+    ? await sbAll(`google_ads_campaign_daily?${base}&report_date=gte.${setting.test_start_date}&report_date=lte.${to}&select=cost_micros,conversions,conversion_value`)
+    : daily.filter(row => !setting?.test_start_date || row.report_date >= setting.test_start_date);
+  return { customer_id: customerId, campaign_id: campaignId, period: { from, to }, daily, search_terms: searchTerms, segments, changes, notes, setting, test_metrics: sumRows(testDaily) };
+}
+
+async function saveCampaignSetting(data) {
+  const customerId = cleanId(data.customer_id);
+  const campaignId = cleanId(data.campaign_id);
+  const commission = data.commission_value === "" || data.commission_value == null ? null : number(data.commission_value);
+  const limit = number(data.test_limit_percent || 75);
+  if (!customerId || !campaignId) throw apiError("Conta e campanha são obrigatórias", 400);
+  if (commission != null && commission <= 0) throw apiError("A comissão deve ser maior que zero", 400);
+  if (limit <= 0 || limit > 500) throw apiError("O limite deve ficar entre 0 e 500%", 400);
+  const row = {
+    user_id: process.env.APP_USER_ID,
+    customer_id: customerId,
+    campaign_id: campaignId,
+    campaign_type: data.campaign_type === "test" ? "test" : "main",
+    commission_value: commission,
+    test_limit_percent: limit,
+    test_start_date: isoDate(data.test_start_date),
+    currency_code: text(data.currency_code, 10),
+    active: data.active !== false,
+    updated_at: new Date().toISOString()
+  };
+  const result = await sb("campaign_settings?on_conflict=user_id,customer_id,campaign_id", {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+    body: JSON.stringify(row)
+  });
+  return result?.[0] || row;
+}
 
 const mime = {
   ".html": "text/html",
@@ -434,10 +590,14 @@ http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, "http://localhost");
     if (url.pathname === "/api/health" && req.method === "GET") {
-      return json(res, 200, { status: "ok", app: "AdsPilot Analytics", version: "1.2.1", mode: process.env.SUPABASE_URL ? "configured" : "demo" });
+      return json(res, 200, { status: "ok", app: "AdsPilot Analytics", version: "2.0.0", mode: process.env.SUPABASE_URL ? "configured" : "demo" });
     }
     if (url.pathname === "/api/config/status" && req.method === "GET") {
       return json(res, 200, configStatus());
+    }
+    if (url.pathname === "/api/public-config" && req.method === "GET") {
+      if (!process.env.SUPABASE_URL || !process.env.SUPABASE_ANON_KEY) throw apiError("Autenticação não configurada", 503);
+      return json(res, 200, { supabaseUrl: process.env.SUPABASE_URL, supabaseAnonKey: process.env.SUPABASE_ANON_KEY });
     }
     if (url.pathname === "/api/webhook/google-ads" && req.method === "POST") {
       if (!secureEqual(req.headers["x-adspilot-secret"], process.env.GOOGLE_ADS_SCRIPT_SECRET)) {
@@ -451,7 +611,39 @@ http.createServer(async (req, res) => {
       }
       return json(res, 200, await syncApi());
     }
+    if (url.pathname === "/api/v2/dashboard" && req.method === "GET") {
+      await authenticate(req);
+      return json(res, 200, await getDashboard(url));
+    }
+    if (url.pathname === "/api/v2/campaign" && req.method === "GET") {
+      await authenticate(req);
+      return json(res, 200, await getCampaignDetail(url));
+    }
+    if (url.pathname === "/api/v2/campaign-settings" && (req.method === "PUT" || req.method === "POST")) {
+      await authenticate(req);
+      return json(res, 200, await saveCampaignSetting(await readJsonBody(req)));
+    }
+    if (url.pathname === "/api/v2/notes" && req.method === "POST") {
+      await authenticate(req);
+      const data = await readJsonBody(req);
+      if (!data.content || !cleanId(data.campaign_id) || !cleanId(data.customer_id)) throw apiError("Dados da nota incompletos", 400);
+      const result = await sb("campaign_notes", {
+        method: "POST",
+        headers: { Prefer: "return=representation" },
+        body: JSON.stringify({
+          user_id: process.env.APP_USER_ID,
+          customer_id: cleanId(data.customer_id),
+          campaign_id: cleanId(data.campaign_id),
+          note_date: isoDate(data.note_date) || day(0),
+          category: text(data.category || "observation", 50),
+          title: text(data.title, 200),
+          content: text(data.content, 5000)
+        })
+      });
+      return json(res, 201, result?.[0] || result);
+    }
     if (url.pathname === "/api/notes" && req.method === "POST") {
+      await authenticate(req);
       const data = await readJsonBody(req);
       if (!data.content || !data.campaign_id) return json(res, 400, { error: "Dados ausentes" });
       return json(res, 201, await sb("campaign_notes", {
@@ -476,4 +668,4 @@ http.createServer(async (req, res) => {
     console.error(error);
     json(res, error.statusCode || 500, { error: error.statusCode ? error.message : "Erro interno" });
   }
-}).listen(port, "0.0.0.0", () => console.log(`AdsPilot v1.2.1 on ${port}`));
+}).listen(port, "0.0.0.0", () => console.log(`AdsPilot v2.0.0 on ${port}`));
