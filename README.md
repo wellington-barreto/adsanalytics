@@ -1,6 +1,10 @@
-# AdsPilot Analytics V1
+# AdsPilot Analytics V1.2
 
 Primeira versão do painel Google Ads: dashboard geral, detalhes de campanha, histórico diário, alterações automáticas, notas manuais e sincronizador Google Ads → Supabase.
+
+A V1.2 acrescenta ingestão autenticada via Google Ads Scripts para uso enquanto
+o Acesso Básico da Google Ads API estiver pendente. Consulte
+`INSTALACAO_V1.2.md`.
 
 ## Testar localmente
 
@@ -23,6 +27,19 @@ Sem credenciais, a interface abre em modo demonstração.
 2. No Railway: **New Project → Deploy from GitHub**.
 3. Copie `.env.example` para as Variables e preencha os valores.
 4. O healthcheck é `/api/health`.
+
+Para conferir se as variáveis foram preenchidas sem expor seus valores, acesse
+`GET /api/config/status`. O endpoint retorna apenas indicadores `true`/`false`.
+
+## Sincronização via Google Ads Script (V1.2)
+
+```text
+POST https://SEU-DOMINIO/api/webhook/google-ads
+x-adspilot-secret: VALOR_DE_GOOGLE_ADS_SCRIPT_SECRET
+```
+
+O script pronto para conta individual e MCC está em
+`google-ads-scripts/adspilot-v1.2.js`.
 
 ## Sincronizar
 
