@@ -1,4 +1,4 @@
-# AdsPilot Analytics V2.2
+# AdsPilot Analytics V2.3
 
 Primeira versão do painel Google Ads: dashboard geral, detalhes de campanha, histórico diário, alterações automáticas, notas manuais e sincronizador Google Ads → Supabase.
 
@@ -17,6 +17,11 @@ A V2.2 acrescenta grids agrupadas e ordenáveis, calendário de intervalo,
 tooltips, públicos amigáveis, geografia com drill-down, CPA desejado efetivo,
 contagem de grupos/anúncios e visualizações em tabela ou gráfico. Para atualizar
 uma instalação existente, consulte `INSTALACAO_V2.2.md`.
+
+A V2.3 padroniza gráficos e medidores em Apache ECharts, adiciona exportação
+XLSX, filtro de todo o período, ciclos de Comissão/CPA configuráveis,
+totalizadores comparativos e histórico imutável de orçamento/CPA. Consulte
+`INSTALACAO_V2.3.md` antes de publicar a atualização.
 
 ## Testar localmente
 

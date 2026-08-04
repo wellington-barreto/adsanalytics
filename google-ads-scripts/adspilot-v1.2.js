@@ -1,5 +1,5 @@
 /**
- * AdsPilot Analytics V2.1
+ * AdsPilot Analytics V2.3.0 — coleta diária completa
  * Funciona em conta individual ou MCC.
  * Somente leitura: nao cria nem altera campanhas, anuncios, palavras ou lances.
  */
@@ -46,13 +46,21 @@ function processManagedAccount(configJson) {
 
 function allAccountsFinished(results) {
   var success = 0;
+  var partial = 0;
   var errors = 0;
   for (var i = 0; i < results.length; i++) {
-    if (results[i].getStatus() === "OK") success++;
-    else errors++;
+    if (results[i].getStatus() !== "OK") errors++;
+    else {
+      try {
+        var response = JSON.parse(results[i].getReturnValue() || "{}");
+        if (response.status === "ok") success++;
+        else if (response.status === "partial") partial++;
+        else errors++;
+      } catch (parseError) { errors++; }
+    }
     Logger.log("Conta " + results[i].getCustomerId() + ": " + results[i].getStatus() + " " + (results[i].getError() || results[i].getReturnValue() || ""));
   }
-  Logger.log("AdsPilot MCC finalizado. Sucesso: " + success + ", erros: " + errors);
+  Logger.log("AdsPilot MCC finalizado. Sincronizadas: " + success + ", parciais: " + partial + ", erros: " + errors);
 }
 
 function collectAndSend_(config) {
@@ -61,6 +69,7 @@ function collectAndSend_(config) {
   var dates = dateRange_(account.getTimeZone(), config);
   var errors = [];
   var campaigns = safeQuery_(campaignQuery_(dates.start, dates.end), config, "campanhas", errors);
+  if (hasQueryError_(errors, "campanhas")) throw new Error("A consulta principal de campanhas falhou: " + errors[errors.length - 1].error);
   var searchTerms = safeQuery_(searchTermsQuery_(dates.start, dates.end, config.MAX_SEARCH_TERMS), config, "termos", errors);
   var devices = safeQuery_(deviceQuery_(dates.start, dates.end), config, "dispositivos", errors);
   var ages = safeQuery_(ageQuery_(dates.start, dates.end), config, "idades", errors);
@@ -77,7 +86,7 @@ function collectAndSend_(config) {
 
   var payload = {
     schema_version: "1.2",
-    script_name: "AdsPilot Google Ads Script V2.2",
+    script_name: "AdsPilot Google Ads Script V2.3",
     started_at: startedAt,
     account: {
       customer_id: account.getCustomerId(),
@@ -94,6 +103,10 @@ function collectAndSend_(config) {
   };
 
   var parsed = sendWithRetry_(config, payload, account.getCustomerId());
+  if (errors.length && parsed.status === "ok") {
+    parsed.status = "partial";
+    parsed.queryErrors = errors.length;
+  }
   var body = JSON.stringify(parsed);
   Logger.log("AdsPilot sincronizado: " + body);
   return parsed;
@@ -140,12 +153,19 @@ function safeQuery_(query, config, label, errors) {
   return rows;
 }
 
+function hasQueryError_(errors, label) {
+  for (var i = 0; i < errors.length; i++) {
+    if (errors[i].query === label) return true;
+  }
+  return false;
+}
+
 function campaignQuery_(start, end) {
-  return "SELECT segments.date, campaign.id, campaign.name, campaign.status, campaign.start_date, " +
+  return "SELECT segments.date, campaign.id, campaign.name, campaign.status, " +
     "campaign.advertising_channel_type, campaign.bidding_strategy_type, " +
     "campaign_budget.amount_micros, campaign.target_cpa.target_cpa_micros, " +
     "campaign.target_roas.target_roas, campaign.maximize_conversions.target_cpa_micros, " +
-    "metrics.impressions, metrics.clicks, metrics.ctr, metrics.average_cpc, " +
+    "metrics.impressions, metrics.clicks, metrics.ctr, metrics.average_cpc, metrics.average_target_cpa_micros, " +
     "metrics.cost_micros, metrics.conversions, metrics.conversions_value, " +
     "metrics.search_impression_share, metrics.search_top_impression_share, " +
     "metrics.search_absolute_top_impression_share " +
@@ -245,12 +265,13 @@ function mapCampaigns_(rows, landingPages, adGroups, ads) {
     var row = rows[i];
     var targetCpa = value_(row.campaign.maximizeConversions && row.campaign.maximizeConversions.targetCpaMicros);
     if (!targetCpa) targetCpa = value_(row.campaign.targetCpa && row.campaign.targetCpa.targetCpaMicros);
+    var averageTargetCpa = value_(row.metrics.averageTargetCpaMicros);
     output.push({
       report_date: row.segments.date,
       campaign_id: String(row.campaign.id),
       campaign_name: row.campaign.name,
       campaign_status: row.campaign.status,
-      campaign_start_date: row.campaign.startDate || null,
+      campaign_start_date: null,
       channel_type: row.campaign.advertisingChannelType,
       bidding_strategy_type: row.campaign.biddingStrategyType,
       budget_micros: value_(row.campaignBudget.amountMicros),
@@ -258,10 +279,10 @@ function mapCampaigns_(rows, landingPages, adGroups, ads) {
       target_roas: value_(row.campaign.targetRoas && row.campaign.targetRoas.targetRoas),
       ad_group_count: (groupMeta[String(row.campaign.id)] || {}).count || 0,
       ad_count: adCounts[String(row.campaign.id)] || 0,
-      desired_cpa_micros: (groupMeta[String(row.campaign.id)] || {}).average || targetCpa,
+      desired_cpa_micros: (groupMeta[String(row.campaign.id)] || {}).average || averageTargetCpa || targetCpa,
       desired_cpa_is_average: Boolean((groupMeta[String(row.campaign.id)] || {}).isAverage),
-      desired_cpa_min_micros: (groupMeta[String(row.campaign.id)] || {}).min || targetCpa,
-      desired_cpa_max_micros: (groupMeta[String(row.campaign.id)] || {}).max || targetCpa,
+      desired_cpa_min_micros: (groupMeta[String(row.campaign.id)] || {}).min || averageTargetCpa || targetCpa,
+      desired_cpa_max_micros: (groupMeta[String(row.campaign.id)] || {}).max || averageTargetCpa || targetCpa,
       desired_cpa_group_count: (groupMeta[String(row.campaign.id)] || {}).count || 0,
       impressions: value_(row.metrics.impressions),
       clicks: value_(row.metrics.clicks),

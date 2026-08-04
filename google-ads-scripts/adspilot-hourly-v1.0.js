@@ -1,5 +1,5 @@
 /**
- * AdsPilot Hourly V1.0
+ * AdsPilot Hourly V2.3 — coleta leve por hora
  * Atualiza somente as metricas acumuladas do dia atual.
  * Funciona em conta individual ou MCC e nao altera o Google Ads.
  */
@@ -60,7 +60,7 @@ function collectAndSend_(config) {
     "campaign.advertising_channel_type, campaign.bidding_strategy_type, " +
     "campaign_budget.amount_micros, campaign.target_cpa.target_cpa_micros, " +
     "campaign.target_roas.target_roas, campaign.maximize_conversions.target_cpa_micros, " +
-    "metrics.impressions, metrics.clicks, metrics.ctr, metrics.average_cpc, " +
+    "metrics.impressions, metrics.clicks, metrics.ctr, metrics.average_cpc, metrics.average_target_cpa_micros, " +
     "metrics.cost_micros, metrics.conversions, metrics.conversions_value, " +
     "metrics.search_impression_share, metrics.search_top_impression_share, " +
     "metrics.search_absolute_top_impression_share " +
@@ -72,7 +72,7 @@ function collectAndSend_(config) {
 
   var payload = {
     schema_version: "1.2",
-    script_name: "AdsPilot Hourly V1.0",
+    script_name: "AdsPilot Hourly V2.3",
     started_at: new Date().toISOString(),
     account: {
       customer_id: customerId,
@@ -95,6 +95,7 @@ function collectAndSend_(config) {
 function mapCampaign_(row) {
   var targetCpa = value_(row.campaign.maximizeConversions && row.campaign.maximizeConversions.targetCpaMicros);
   if (!targetCpa) targetCpa = value_(row.campaign.targetCpa && row.campaign.targetCpa.targetCpaMicros);
+  var desiredCpa = value_(row.metrics.averageTargetCpaMicros) || targetCpa;
   return {
     report_date: row.segments.date,
     campaign_id: String(row.campaign.id),
@@ -104,6 +105,11 @@ function mapCampaign_(row) {
     bidding_strategy_type: row.campaign.biddingStrategyType,
     budget_micros: value_(row.campaignBudget.amountMicros),
     target_cpa_micros: targetCpa,
+    desired_cpa_micros: desiredCpa,
+    desired_cpa_is_average: false,
+    desired_cpa_min_micros: desiredCpa,
+    desired_cpa_max_micros: desiredCpa,
+    desired_cpa_group_count: 0,
     target_roas: value_(row.campaign.targetRoas && row.campaign.targetRoas.targetRoas),
     impressions: value_(row.metrics.impressions),
     clicks: value_(row.metrics.clicks),
@@ -159,4 +165,3 @@ function validateConfig_(config) {
     throw new Error("Configure WEBHOOK_SECRET com a mesma chave do Railway");
   }
 }
-
