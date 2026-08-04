@@ -704,12 +704,14 @@ async function getCampaignDetail(url) {
     sbAll(`campaign_strategies?${base}&select=*`)
   ]);
   const daily = mergeDaily(googleDaily, manualDaily);
-  let cycleFrom = setting?.test_start_date || from;
+  let cycleFrom = from;
   if (setting?.cycle_scope === "conversion_window") {
     const start = new Date(`${to}T12:00:00Z`);
     start.setUTCDate(start.getUTCDate() - Math.max(0, integer(setting.conversion_window_days || 7) - 1));
     cycleFrom = start.toISOString().slice(0,10);
-    if (setting?.test_start_date && setting.test_start_date > cycleFrom) cycleFrom = setting.test_start_date;
+  } else {
+    const firstRows = await sbAll(`google_ads_campaign_daily?${base}&select=report_date&order=report_date.asc&limit=1`);
+    cycleFrom = firstRows[0]?.report_date || from;
   }
   let cycleGoogle = googleDaily.filter(row => row.report_date >= cycleFrom);
   let cycleManual = manualDaily.filter(row => row.report_date >= cycleFrom);
@@ -792,7 +794,7 @@ http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, "http://localhost");
     if (url.pathname === "/api/health" && req.method === "GET") {
-      return json(res, 200, { status: "ok", app: "AdsPilot Analytics", version: "2.3.0", mode: process.env.SUPABASE_URL ? "configured" : "demo" });
+      return json(res, 200, { status: "ok", app: "AdsPilot Analytics", version: "2.3.1", mode: process.env.SUPABASE_URL ? "configured" : "demo" });
     }
     if (url.pathname === "/api/config/status" && req.method === "GET") {
       return json(res, 200, configStatus());
@@ -888,4 +890,4 @@ http.createServer(async (req, res) => {
     console.error(error);
     json(res, error.statusCode || 500, { error: error.statusCode ? error.message : "Erro interno" });
   }
-}).listen(port, "0.0.0.0", () => console.log(`AdsPilot v2.3.0 on ${port}`));
+}).listen(port, "0.0.0.0", () => console.log(`AdsPilot v2.3.1 on ${port}`));

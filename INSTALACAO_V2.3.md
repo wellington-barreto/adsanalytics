@@ -23,7 +23,7 @@ ambiente. Depois do deploy, confirme:
 GET /api/health
 ```
 
-Resposta esperada: `version: 2.3.0`.
+Resposta esperada: `version: 2.3.1`.
 
 ## 3. Google Ads Scripts
 
