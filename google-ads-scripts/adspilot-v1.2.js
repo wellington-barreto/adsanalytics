@@ -66,15 +66,18 @@ function collectAndSend_(config) {
   var ages = safeQuery_(ageQuery_(dates.start, dates.end), config, "idades", errors);
   var genders = safeQuery_(genderQuery_(dates.start, dates.end), config, "generos", errors);
   var incomes = safeQuery_(incomeQuery_(dates.start, dates.end), config, "rendas", errors);
-  var locations = safeQuery_(locationQuery_(dates.start, dates.end), config, "locais", errors);
-  var targetedLocations = safeQuery_(targetedLocationQuery_(dates.start, dates.end), config, "locais segmentados", errors);
-  var geoConstants = safeQuery_(geoConstantsQuery_(criterionIds_(targetedLocations)), config, "nomes dos locais", errors);
+  var countryLocations = safeQuery_(countryLocationQuery_(dates.start, dates.end), config, "paises", errors);
+  var stateLocations = safeQuery_(stateLocationQuery_(dates.start, dates.end), config, "estados", errors);
+  var cityLocations = safeQuery_(cityLocationQuery_(dates.start, dates.end), config, "cidades", errors);
+  var geoConstants = safeQuery_(geoConstantsQuery_(geoIds_(countryLocations, stateLocations, cityLocations)), config, "nomes dos locais", errors);
   var landingPages = safeQuery_(landingPageQuery_(dates.start, dates.end), config, "paginas finais", errors);
+  var adGroups = safeQuery_(adGroupQuery_(), config, "grupos de anuncios", errors);
+  var ads = safeQuery_(adQuery_(), config, "anuncios", errors);
   var changes = safeQuery_(changeQuery_(dates.start, dates.end, config.MAX_CHANGE_EVENTS), config, "alteracoes", errors);
 
   var payload = {
     schema_version: "1.2",
-    script_name: "AdsPilot Google Ads Script V2.1",
+    script_name: "AdsPilot Google Ads Script V2.2",
     started_at: startedAt,
     account: {
       customer_id: account.getCustomerId(),
@@ -82,9 +85,10 @@ function collectAndSend_(config) {
       currency_code: account.getCurrencyCode(),
       timezone: account.getTimeZone()
     },
-    campaign_daily: mapCampaigns_(campaigns, landingPages),
+    campaign_daily: mapCampaigns_(campaigns, landingPages, adGroups, ads),
     search_terms: aggregateSearchTerms_(mapSearchTerms_(searchTerms)),
-    segments: mapSegments_(devices, ages, genders, incomes, locations, targetedLocations, geoConstants),
+    segments: mapSegments_(devices, ages, genders, incomes),
+    locations: mapLocations_(countryLocations, stateLocations, cityLocations, geoConstants),
     change_events: mapChanges_(changes),
     query_errors: errors
   };
@@ -137,7 +141,7 @@ function safeQuery_(query, config, label, errors) {
 }
 
 function campaignQuery_(start, end) {
-  return "SELECT segments.date, campaign.id, campaign.name, campaign.status, " +
+  return "SELECT segments.date, campaign.id, campaign.name, campaign.status, campaign.start_date, " +
     "campaign.advertising_channel_type, campaign.bidding_strategy_type, " +
     "campaign_budget.amount_micros, campaign.target_cpa.target_cpa_micros, " +
     "campaign.target_roas.target_roas, campaign.maximize_conversions.target_cpa_micros, " +
@@ -180,21 +184,35 @@ function incomeQuery_(start, end) {
     "FROM income_range_view WHERE segments.date BETWEEN '" + start + "' AND '" + end + "' AND metrics.impressions > 0";
 }
 
-function locationQuery_(start, end) {
+function countryLocationQuery_(start, end) {
   return "SELECT segments.date, campaign.id, geographic_view.country_criterion_id, geographic_view.location_type, " +
     "metrics.impressions, metrics.clicks, metrics.cost_micros, metrics.conversions, metrics.conversions_value " +
     "FROM geographic_view WHERE segments.date BETWEEN '" + start + "' AND '" + end + "' AND metrics.impressions > 0";
 }
 
-function targetedLocationQuery_(start, end) {
-  return "SELECT segments.date, campaign.id, ad_group_criterion.criterion_id, metrics.impressions, metrics.clicks, " +
-    "metrics.cost_micros, metrics.conversions, metrics.conversions_value FROM location_view " +
+function stateLocationQuery_(start, end) {
+  return "SELECT segments.date, campaign.id, geographic_view.country_criterion_id, segments.geo_target_region, " +
+    "metrics.impressions, metrics.clicks, metrics.cost_micros, metrics.conversions, metrics.conversions_value FROM geographic_view " +
+    "WHERE segments.date BETWEEN '" + start + "' AND '" + end + "' AND metrics.impressions > 0";
+}
+
+function cityLocationQuery_(start, end) {
+  return "SELECT segments.date, campaign.id, geographic_view.country_criterion_id, segments.geo_target_region, segments.geo_target_city, " +
+    "metrics.impressions, metrics.clicks, metrics.cost_micros, metrics.conversions, metrics.conversions_value FROM geographic_view " +
     "WHERE segments.date BETWEEN '" + start + "' AND '" + end + "' AND metrics.impressions > 0";
 }
 
 function geoConstantsQuery_(ids) {
   if (!ids.length) return "SELECT geo_target_constant.id, geo_target_constant.name, geo_target_constant.canonical_name, geo_target_constant.target_type FROM geo_target_constant WHERE geo_target_constant.id = 0";
-  return "SELECT geo_target_constant.id, geo_target_constant.name, geo_target_constant.canonical_name, geo_target_constant.target_type FROM geo_target_constant WHERE geo_target_constant.id IN (" + ids.join(",") + ")";
+  return "SELECT geo_target_constant.id, geo_target_constant.name, geo_target_constant.canonical_name, geo_target_constant.country_code, geo_target_constant.target_type FROM geo_target_constant WHERE geo_target_constant.id IN (" + ids.join(",") + ")";
+}
+
+function adGroupQuery_() {
+  return "SELECT campaign.id, campaign.target_cpa.target_cpa_micros, campaign.maximize_conversions.target_cpa_micros, ad_group.id, ad_group.status, ad_group.target_cpa_micros FROM ad_group WHERE ad_group.status = 'ENABLED'";
+}
+
+function adQuery_() {
+  return "SELECT campaign.id, ad_group_ad.ad.id, ad_group_ad.ad.final_urls, ad_group_ad.status FROM ad_group_ad WHERE ad_group_ad.status != 'REMOVED'";
 }
 
 function landingPageQuery_(start, end) {
@@ -212,9 +230,16 @@ function changeQuery_(start, end, limit) {
     "ORDER BY change_event.change_date_time DESC LIMIT " + limit;
 }
 
-function mapCampaigns_(rows, landingPages) {
+function mapCampaigns_(rows, landingPages, adGroups, ads) {
   var output = [];
   var urls = {};
+  var groupMeta = campaignGroupMeta_(adGroups);
+  var adCounts = {};
+  for (var a = 0; a < ads.length; a++) {
+    var ac = String(ads[a].campaign.id), finalUrls = ads[a].adGroupAd.ad.finalUrls || [];
+    adCounts[ac] = (adCounts[ac] || 0) + 1;
+    if (!urls[ac] && finalUrls.length) urls[ac] = finalUrls[0];
+  }
   for (var u = 0; u < landingPages.length; u++) if (!urls[String(landingPages[u].campaign.id)]) urls[String(landingPages[u].campaign.id)] = landingPages[u].landingPageView.unexpandedFinalUrl;
   for (var i = 0; i < rows.length; i++) {
     var row = rows[i];
@@ -225,11 +250,19 @@ function mapCampaigns_(rows, landingPages) {
       campaign_id: String(row.campaign.id),
       campaign_name: row.campaign.name,
       campaign_status: row.campaign.status,
+      campaign_start_date: row.campaign.startDate || null,
       channel_type: row.campaign.advertisingChannelType,
       bidding_strategy_type: row.campaign.biddingStrategyType,
       budget_micros: value_(row.campaignBudget.amountMicros),
       target_cpa_micros: targetCpa,
       target_roas: value_(row.campaign.targetRoas && row.campaign.targetRoas.targetRoas),
+      ad_group_count: (groupMeta[String(row.campaign.id)] || {}).count || 0,
+      ad_count: adCounts[String(row.campaign.id)] || 0,
+      desired_cpa_micros: (groupMeta[String(row.campaign.id)] || {}).average || targetCpa,
+      desired_cpa_is_average: Boolean((groupMeta[String(row.campaign.id)] || {}).isAverage),
+      desired_cpa_min_micros: (groupMeta[String(row.campaign.id)] || {}).min || targetCpa,
+      desired_cpa_max_micros: (groupMeta[String(row.campaign.id)] || {}).max || targetCpa,
+      desired_cpa_group_count: (groupMeta[String(row.campaign.id)] || {}).count || 0,
       impressions: value_(row.metrics.impressions),
       clicks: value_(row.metrics.clicks),
       ctr: value_(row.metrics.ctr),
@@ -283,31 +316,61 @@ function aggregateSearchTerms_(rows) {
   return output;
 }
 
-function mapSegments_(devices, ages, genders, incomes, locations, targetedLocations, geoConstants) {
+function mapSegments_(devices, ages, genders, incomes) {
   var output = [];
   appendSegmentRows_(output, devices, "device", function(row) { return row.segments.device; });
   appendSegmentRows_(output, ages, "age", function(row) { return row.adGroupCriterion.ageRange.type; });
   appendSegmentRows_(output, genders, "gender", function(row) { return row.adGroupCriterion.gender.type; });
   appendSegmentRows_(output, incomes, "income", function(row) { return row.adGroupCriterion.incomeRange.type; });
-  var geo = {};
-  for (var i = 0; i < geoConstants.length; i++) geo[String(geoConstants[i].geoTargetConstant.id)] = geoConstants[i].geoTargetConstant;
-  appendSegmentRows_(output, targetedLocations, "geo", function(row) {
-    var item = geo[String(row.adGroupCriterion.criterionId)] || {};
-    var type = String(item.targetType || "location").toLowerCase();
-    return type + "::" + String(item.canonicalName || item.name || row.adGroupCriterion.criterionId);
-  });
-  for (var j = 0; j < output.length; j++) if (output[j].segment_type === "geo") {
-    var pieces = output[j].segment_value.split("::");
-    output[j].segment_type = pieces[0] === "country" ? "country" : pieces[0] === "state" || pieces[0] === "province" ? "state" : pieces[0] === "city" ? "city" : "location";
-    output[j].segment_value = pieces.slice(1).join("::");
-  }
   return aggregateSegments_(output);
 }
 
-function criterionIds_(rows) {
-  var seen = {}, ids = [];
-  for (var i = 0; i < rows.length; i++) { var id = String(rows[i].adGroupCriterion.criterionId || ""); if (id && !seen[id]) { seen[id] = true; ids.push(id); } }
+function resourceId_(value) { var match = String(value || "").match(/(\d+)$/); return match ? match[1] : ""; }
+
+function geoIds_(countries, states, cities) {
+  var seen = {}, ids = [], all = countries.concat(states).concat(cities);
+  for (var i = 0; i < all.length; i++) {
+    var candidates = [all[i].geographicView && all[i].geographicView.countryCriterionId, all[i].segments && all[i].segments.geoTargetRegion, all[i].segments && all[i].segments.geoTargetCity];
+    for (var j = 0; j < candidates.length; j++) { var id = resourceId_(candidates[j]); if (id && !seen[id]) { seen[id] = true; ids.push(id); } }
+  }
   return ids.slice(0, 10000);
+}
+
+function campaignGroupMeta_(rows) {
+  var grouped = {};
+  for (var i = 0; i < rows.length; i++) {
+    var row = rows[i], id = String(row.campaign.id), campaignCpa = value_(row.campaign.maximizeConversions && row.campaign.maximizeConversions.targetCpaMicros) || value_(row.campaign.targetCpa && row.campaign.targetCpa.targetCpaMicros);
+    var effective = value_(row.adGroup.targetCpaMicros) || campaignCpa;
+    if (!grouped[id]) grouped[id] = { count: 0, values: [] };
+    grouped[id].count++;
+    if (effective > 0) grouped[id].values.push(effective);
+  }
+  for (var id in grouped) if (grouped.hasOwnProperty(id)) {
+    var values = grouped[id].values, sum = 0, unique = {};
+    for (var j = 0; j < values.length; j++) { sum += values[j]; unique[String(values[j])] = true; }
+    grouped[id].average = values.length ? Math.round(sum / values.length) : 0;
+    grouped[id].min = values.length ? Math.min.apply(null, values) : 0;
+    grouped[id].max = values.length ? Math.max.apply(null, values) : 0;
+    grouped[id].isAverage = Object.keys(unique).length > 1;
+  }
+  return grouped;
+}
+
+function mapLocations_(countries, states, cities, constants) {
+  var geo = {}, output = [], countryFallback = {"2840":"Estados Unidos","2076":"Brasil","2124":"Canadá","2036":"Austrália","2826":"Reino Unido","2554":"Nova Zelândia"};
+  for (var i = 0; i < constants.length; i++) geo[String(constants[i].geoTargetConstant.id)] = constants[i].geoTargetConstant;
+  function add(rows, level) {
+    for (var j = 0; j < rows.length; j++) {
+      var row = rows[j], countryId = resourceId_(row.geographicView.countryCriterionId), stateId = resourceId_(row.segments.geoTargetRegion), cityId = resourceId_(row.segments.geoTargetCity);
+      var country = geo[countryId] || {}, state = geo[stateId] || {}, city = geo[cityId] || {};
+      output.push({ report_date: row.segments.date, campaign_id: String(row.campaign.id), location_level: level,
+        country_id: countryId || null, country_code: country.countryCode || null, country_name: countryFallback[countryId] || country.name || country.canonicalName || countryId,
+        state_id: stateId || null, state_name: state.name || state.canonicalName || null,
+        city_id: cityId || null, city_name: city.name || city.canonicalName || null,
+        impressions: value_(row.metrics.impressions), clicks: value_(row.metrics.clicks), cost_micros: value_(row.metrics.costMicros), conversions: value_(row.metrics.conversions), conversion_value: value_(row.metrics.conversionsValue) });
+    }
+  }
+  add(countries, "country"); add(states, "state"); add(cities, "city"); return output;
 }
 
 function appendSegmentRows_(target, rows, type, getValue) {

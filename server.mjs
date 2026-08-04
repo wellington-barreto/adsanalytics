@@ -119,7 +119,7 @@ const validateScriptPayload = payload => {
     error.statusCode = 400;
     throw error;
   }
-  for (const key of ["campaign_daily", "search_terms", "segments", "change_events"]) {
+  for (const key of ["campaign_daily", "search_terms", "segments", "locations", "change_events"]) {
     if (payload[key] != null && !Array.isArray(payload[key])) {
       const error = new Error(`${key} deve ser uma lista`);
       error.statusCode = 400;
@@ -167,12 +167,20 @@ async function ingestGoogleAdsScript(payload) {
       campaign_name: text(row.campaign_name, 500),
       account_name: accountName,
       campaign_status: text(row.campaign_status, 50),
+      campaign_start_date: isoDate(row.campaign_start_date),
       currency_code: currencyCode,
       channel_type: text(row.channel_type, 100),
       bidding_strategy_type: text(row.bidding_strategy_type, 100),
       budget_micros: integer(row.budget_micros),
       target_cpa_micros: integer(row.target_cpa_micros),
       target_roas: number(row.target_roas),
+      ad_group_count: integer(row.ad_group_count),
+      ad_count: integer(row.ad_count),
+      desired_cpa_micros: integer(row.desired_cpa_micros),
+      desired_cpa_is_average: Boolean(row.desired_cpa_is_average),
+      desired_cpa_min_micros: integer(row.desired_cpa_min_micros),
+      desired_cpa_max_micros: integer(row.desired_cpa_max_micros),
+      desired_cpa_group_count: integer(row.desired_cpa_group_count),
       impressions: integer(row.impressions),
       clicks: integer(row.clicks),
       cost_micros: integer(row.cost_micros),
@@ -216,6 +224,27 @@ async function ingestGoogleAdsScript(payload) {
       conversion_value: number(row.conversion_value),
       synced_at: now
     })).filter(row => row.campaign_id && row.report_date && row.segment_type && row.segment_value);
+
+    const locations = (payload.locations || []).map(row => ({
+      user_id: userId,
+      customer_id: customerId,
+      campaign_id: cleanId(row.campaign_id),
+      report_date: isoDate(row.report_date),
+      location_level: ["country", "state", "city"].includes(row.location_level) ? row.location_level : null,
+      country_id: cleanId(row.country_id) || null,
+      country_code: text(row.country_code, 10),
+      country_name: text(row.country_name, 300),
+      state_id: cleanId(row.state_id) || null,
+      state_name: text(row.state_name, 300),
+      city_id: cleanId(row.city_id) || null,
+      city_name: text(row.city_name, 300),
+      impressions: integer(row.impressions),
+      clicks: integer(row.clicks),
+      cost_micros: integer(row.cost_micros),
+      conversions: number(row.conversions),
+      conversion_value: number(row.conversion_value),
+      synced_at: now
+    })).filter(row => row.campaign_id && row.report_date && row.location_level && row.country_id);
 
     const events = (payload.change_events || []).map((row, index) => {
       const changedAt = isoDateTime(row.change_date_time);
@@ -263,6 +292,13 @@ async function ingestGoogleAdsScript(payload) {
         rows: aggregateDuplicates(segments, ["user_id", "customer_id", "campaign_id", "report_date", "segment_type", "segment_value"])
       },
       {
+        name: "locations",
+        count: "locationRows",
+        table: "google_ads_locations_daily",
+        conflict: "user_id,customer_id,campaign_id,report_date,location_level,location_key",
+        rows: aggregateDuplicates(locations, ["user_id", "customer_id", "campaign_id", "report_date", "location_level", "country_id", "state_id", "city_id"])
+      },
+      {
         name: "change_events",
         count: "changeEventRows",
         table: "google_ads_change_events",
@@ -270,7 +306,7 @@ async function ingestGoogleAdsScript(payload) {
         rows: dedupeLast(events, ["resource_name"])
       }
     ];
-    const counts = { campaignRows: 0, searchTermRows: 0, segmentRows: 0, changeEventRows: 0 };
+    const counts = { campaignRows: 0, searchTermRows: 0, segmentRows: 0, locationRows: 0, changeEventRows: 0 };
     const datasetErrors = [];
     for (const dataset of datasets) {
       try {
@@ -291,6 +327,7 @@ async function ingestGoogleAdsScript(payload) {
         campaign_rows: counts.campaignRows,
         search_term_rows: counts.searchTermRows,
         segment_rows: counts.segmentRows,
+        location_rows: counts.locationRows,
         change_event_rows: counts.changeEventRows,
         error_message: datasetErrors.length ? datasetErrors.map(item => `${item.dataset}[${item.code}]: ${item.message}`).join(" | ").slice(0, 2000) : null,
         metadata: {
@@ -540,6 +577,18 @@ async function getDashboard(url) {
       cpa: metrics.conversions ? metrics.cost / metrics.conversions : null,
       profit: metrics.revenue - metrics.cost,
       roi: metrics.cost ? (metrics.revenue - metrics.cost) / metrics.cost * 100 : 0,
+      margin: metrics.revenue ? (metrics.revenue - metrics.cost) / metrics.revenue * 100 : 0,
+      conversion_rate: metrics.clicks ? metrics.conversions / metrics.clicks * 100 : 0,
+      campaign_start_date: latest.campaign_start_date,
+      last_execution_date: [...campaignRows].filter(row => number(row.impressions) || number(row.clicks) || number(row.cost_micros)).sort((a,b) => b.report_date.localeCompare(a.report_date))[0]?.report_date || latest.report_date,
+      final_url: latest.final_url,
+      ad_group_count: number(latest.ad_group_count),
+      ad_count: number(latest.ad_count),
+      desired_cpa: number(latest.desired_cpa_micros) / 1e6 || null,
+      desired_cpa_is_average: Boolean(latest.desired_cpa_is_average),
+      desired_cpa_min: number(latest.desired_cpa_min_micros) / 1e6 || null,
+      desired_cpa_max: number(latest.desired_cpa_max_micros) / 1e6 || null,
+      desired_cpa_group_count: number(latest.desired_cpa_group_count),
       setting,
       test: setting ? {
         cost: testCost,
@@ -574,11 +623,12 @@ async function getCampaignDetail(url) {
   const base = `user_id=eq.${enc(userId)}&customer_id=eq.${enc(customerId)}&campaign_id=eq.${enc(campaignId)}`;
   const settings = await sbAll(`campaign_settings?${base}&select=*`);
   const setting = settings[0] || null;
-  const [googleDaily, manualDaily, searchTerms, segments, changes, notes, strategies] = await Promise.all([
+  const [googleDaily, manualDaily, searchTerms, segments, locations, changes, notes, strategies] = await Promise.all([
     sbAll(`google_ads_campaign_daily?${base}&report_date=gte.${from}&report_date=lte.${to}&order=report_date.asc&select=*`),
     sbAll(`campaign_manual_daily?${base}&report_date=gte.${from}&report_date=lte.${to}&order=report_date.desc&select=*`),
     sbAll(`google_ads_search_terms_daily?${base}&report_date=gte.${from}&report_date=lte.${to}&order=cost_micros.desc&select=*`),
     sbAll(`google_ads_segments_daily?${base}&report_date=gte.${from}&report_date=lte.${to}&order=cost_micros.desc&select=*`),
+    sbAll(`google_ads_locations_daily?${base}&report_date=gte.${from}&report_date=lte.${to}&order=cost_micros.desc&select=*`),
     sbAll(`google_ads_change_events?${base}&change_date_time=gte.${from}T00%3A00%3A00Z&change_date_time=lte.${to}T23%3A59%3A59Z&order=change_date_time.desc&select=*`),
     sbAll(`campaign_notes?${base}&order=note_date.desc,created_at.desc&select=*`),
     sbAll(`campaign_strategies?${base}&select=*`)
@@ -587,7 +637,7 @@ async function getCampaignDetail(url) {
   const testDaily = setting?.test_start_date && setting.test_start_date < from
     ? await sbAll(`google_ads_campaign_daily?${base}&report_date=gte.${setting.test_start_date}&report_date=lte.${to}&select=cost_micros,conversions,conversion_value`)
     : daily.filter(row => !setting?.test_start_date || row.report_date >= setting.test_start_date);
-  return { customer_id: customerId, campaign_id: campaignId, period: { from, to }, daily, search_terms: searchTerms, segments, changes, notes, setting, strategy: strategies[0] || null, test_metrics: sumRows(testDaily) };
+  return { customer_id: customerId, campaign_id: campaignId, period: { from, to }, daily, search_terms: searchTerms, segments, locations, changes, notes, setting, strategy: strategies[0] || null, test_metrics: sumRows(testDaily) };
 }
 
 async function saveCampaignSetting(data) {
@@ -655,7 +705,7 @@ http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, "http://localhost");
     if (url.pathname === "/api/health" && req.method === "GET") {
-      return json(res, 200, { status: "ok", app: "AdsPilot Analytics", version: "2.1.0", mode: process.env.SUPABASE_URL ? "configured" : "demo" });
+      return json(res, 200, { status: "ok", app: "AdsPilot Analytics", version: "2.2.0", mode: process.env.SUPABASE_URL ? "configured" : "demo" });
     }
     if (url.pathname === "/api/config/status" && req.method === "GET") {
       return json(res, 200, configStatus());
@@ -747,4 +797,4 @@ http.createServer(async (req, res) => {
     console.error(error);
     json(res, error.statusCode || 500, { error: error.statusCode ? error.message : "Erro interno" });
   }
-}).listen(port, "0.0.0.0", () => console.log(`AdsPilot v2.1.0 on ${port}`));
+}).listen(port, "0.0.0.0", () => console.log(`AdsPilot v2.2.0 on ${port}`));
